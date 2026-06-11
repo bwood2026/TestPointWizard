@@ -1,0 +1,265 @@
+{$FORM TDialog1Form, Dialog1.sfm}
+uses
+  Classes, Graphics, Controls, Forms, Dialogs, StdCtrls;
+
+// ============================================================
+// CP-036 Pressure Devices by Comparison
+// Test Point Wizard — v5
+// Author: B. Wood
+//
+// Changes from v4:
+//   - Reverted to match existing form layout (no form changes)
+//   - Gage ID field auto-populated from LocatingEquipmentID
+//   - Load button now refreshes from equipment record
+//   - Full Scale and Units auto-populated on form open
+//   - Hint messages via ShowMessage instead of on-form labels
+//   - SetEquipmentFieldText writes back on Generate
+//   - RefreshTestPointsGrid called after writing
+// ============================================================
+
+// ============================================================
+// PROCEDURE: Form2Create
+// Fires automatically when the wizard opens.
+// Auto-populates Gage ID, Full Scale, and Units.
+// ============================================================
+procedure Form2Create(Sender: TObject);
+var
+  GageID   : string;
+  Capacity : string;
+  Units    : string;
+begin
+  GageID := LocatingEquipmentID;
+  edtGageID.Text := GageID;
+
+  if GageID = '' then
+  begin
+    ShowMessage(
+      'Could not determine the current equipment record.' + #13 +
+      'Please close and relaunch the wizard from an equipment record.'
+    );
+    Exit;
+  end;
+
+  Capacity := LookupEquipmentFieldText('ATTRIBUTE1');
+  edtFullScale.Text := Capacity;
+
+  Units := LookupEquipmentFieldText('UNIT_MEASURE');
+  edtUnits.Text := Units;
+end;
+
+// ============================================================
+// PROCEDURE: btnLoadClick
+// Manual refresh — re-reads equipment record into form fields.
+// Useful if the tech wants to revert changes they made.
+// ============================================================
+procedure btnLoadClick(Sender: TObject);
+var
+  GageID   : string;
+  Capacity : string;
+  Units    : string;
+begin
+  GageID := LocatingEquipmentID;
+  edtGageID.Text := GageID;
+
+  if GageID = '' then
+  begin
+    ShowMessage('Could not determine the current equipment record.');
+    Exit;
+  end;
+
+  Capacity := LookupEquipmentFieldText('ATTRIBUTE1');
+  edtFullScale.Text := Capacity;
+  if Capacity = '' then
+    ShowMessage(
+      'Full Scale attribute not found on equipment record.' + #13 +
+      'Please enter manually.'
+    );
+
+  Units := LookupEquipmentFieldText('UNIT_MEASURE');
+  edtUnits.Text := Units;
+  if Units = '' then
+    ShowMessage(
+      'Unit of Measure not found on equipment record.' + #13 +
+      'Please enter manually.'
+    );
+end;
+
+// ============================================================
+// PROCEDURE: btnCancelClick
+// ============================================================
+procedure btnCancelClick(Sender: TObject);
+begin
+  Close;
+end;
+
+// ============================================================
+// PROCEDURE: btnGenerateClick
+// ============================================================
+procedure btnGenerateClick(Sender: TObject);
+var
+  GageID      : string;
+  Company     : string;
+  FullScale   : Double;
+  Units       : string;
+  Grade       : string;
+  TolPct      : Double;
+  IsReading   : Boolean;
+  Tol         : Double;
+  Points      : array[0..7] of Double;
+  TolPlus     : array[0..7] of Double;
+  TolMinus    : array[0..7] of Double;
+  Descs       : array[0..7] of string;
+  i           : Integer;
+  Seq         : Integer;
+  SQL         : string;
+begin
+
+  // ── Re-grab context ──────────────────────────────────────
+  GageID  := LocatingEquipmentID;
+  Company := LocatingEquipmentCompany;
+
+  if GageID = '' then
+  begin
+    ShowMessage('Could not determine the current equipment record. Please close and try again.');
+    Exit;
+  end;
+
+  // ── Input validation ─────────────────────────────────────
+  if Trim(edtFullScale.Text) = '' then
+  begin
+    ShowMessage('Please enter a Full Scale value.');
+    Exit;
+  end;
+
+  if edtUnits.Text = '' then
+  begin
+    ShowMessage('Please enter a Unit of Measure.');
+    Exit;
+  end;
+
+  if cboGrade.ItemIndex < 0 then
+  begin
+    ShowMessage('Please select an ASME Grade.');
+    Exit;
+  end;
+
+  FullScale := StrToFloat(edtFullScale.Text);
+
+  if FullScale <= 0 then
+  begin
+    ShowMessage(
+      'Full Scale value must be greater than zero.' + #13 +
+      'Please correct and try again.'
+    );
+    Exit;
+  end;
+
+  Units := edtUnits.Text;
+  Grade := cboGrade.Text;
+
+  // ── Grade to tolerance percentage mapping ────────────────
+  IsReading := False;
+  TolPct    := 0.0200;
+
+  // B40.1 Dial type grades
+  if      Grade = '4A'  then TolPct := 0.0010
+  else if Grade = '3A'  then TolPct := 0.0025
+  else if Grade = '2A'  then TolPct := 0.0050
+  else if Grade = '1A'  then TolPct := 0.0100
+  else if Grade = 'A'   then TolPct := 0.0100
+  else if Grade = 'B'   then TolPct := 0.0200
+  else if Grade = 'C'   then TolPct := 0.0300
+  else if Grade = 'D'   then TolPct := 0.0500
+  // B40.7 Digital span-based grades
+  else if Grade = '5A'  then TolPct := 0.0005
+  // B40.7 Digital reading-based grades (R suffix)
+  else if Grade = '5AR' then begin TolPct := 0.0005; IsReading := True; end
+  else if Grade = '4AR' then begin TolPct := 0.0010; IsReading := True; end
+  else if Grade = '3AR' then begin TolPct := 0.0025; IsReading := True; end
+  else if Grade = '2AR' then begin TolPct := 0.0050; IsReading := True; end
+  else if Grade = 'AR'  then begin TolPct := 0.0100; IsReading := True; end
+  else if Grade = 'BR'  then begin TolPct := 0.0200; IsReading := True; end;
+
+  if not IsReading then
+    Tol := FullScale * TolPct;
+
+  // ── Define test points ───────────────────────────────────
+  Points[0] := 0.20 * FullScale;  Descs[0] := '20% of Full Scale (Ascending)';
+  Points[1] := 0.40 * FullScale;  Descs[1] := '40% of Full Scale (Ascending)';
+  Points[2] := 0.60 * FullScale;  Descs[2] := '60% of Full Scale (Ascending)';
+  Points[3] := 0.80 * FullScale;  Descs[3] := '80% of Full Scale (Ascending)';
+  Points[4] := 1.00 * FullScale;  Descs[4] := '100% of Full Scale (Ascending)';
+  Points[5] := 0.60 * FullScale;  Descs[5] := '60% of Full Scale (Descending)';
+  Points[6] := 0.40 * FullScale;  Descs[6] := '40% of Full Scale (Descending)';
+  Points[7] := 0.00;              Descs[7] := 'Return to Zero (Descending)';
+
+  // ── Calculate tolerances per point ───────────────────────
+  for i := 0 to 7 do
+  begin
+    if Points[i] = 0 then
+    begin
+      TolPlus[i]  := 0;
+      TolMinus[i] := 0;
+    end
+    else if IsReading then
+    begin
+      Tol         := Points[i] * TolPct;
+      TolPlus[i]  := Points[i] + Tol;
+      TolMinus[i] := Points[i] - Tol;
+    end
+    else
+    begin
+      TolPlus[i]  := Points[i] + Tol;
+      TolMinus[i] := Points[i] - Tol;
+    end;
+  end;
+
+  // ── Write attributes back to equipment record ─────────────
+  SetEquipmentFieldText('ATTRIBUTE1', edtFullScale.Text);
+  SetEquipmentFieldText('UNIT_MEASURE', edtUnits.Text);
+
+  // ── Clear existing test points ───────────────────────────
+  ReturnFromSQL(
+    'DELETE FROM TESTPNTS ' +
+    'WHERE GAGE_SN = ''' + GageID + ''' ' +
+    'AND COMPANY = ''' + Company + ''''
+  );
+
+  // ── Insert new test point rows ───────────────────────────
+  Seq := 1;
+  for i := 0 to 7 do
+  begin
+    SQL :=
+      'INSERT INTO TESTPNTS ' +
+      '(COMPANY, GAGE_SN, LINE_NO, LINE_DESCRIPTION, ' +
+      'LINE_STANDARD, TOLERANCE1, TOLERANCE2, UNIT_MEASURE) ' +
+      'VALUES (' +
+      '''' + Company + ''', ' +
+      '''' + GageID + ''', ' +
+      IntToStr(Seq) + ', ' +
+      '''' + Descs[i] + ''', ' +
+      FormatFloat('0.######', Points[i]) + ', ' +
+      FormatFloat('0.######', TolPlus[i]) + ', ' +
+      FormatFloat('0.######', TolMinus[i]) + ', ' +
+      '''' + Units + ''')';
+    ReturnFromSQL(SQL);
+    Seq := Seq + 1;
+  end;
+
+  // ── Refresh the test points grid ─────────────────────────
+  RefreshTestPointsGrid;
+
+  // ── Confirm and close ────────────────────────────────────
+  ShowMessage(
+    'Test points written successfully.' + #13 +
+    'Gage ID : ' + GageID + #13 +
+    'Company : ' + Company + #13 +
+    'Grade   : ' + Grade + #13 +
+    '8 test point rows written.'
+  );
+
+  Close;
+end;
+
+begin
+end.
