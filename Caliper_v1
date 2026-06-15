@@ -1,0 +1,610 @@
+{$FORM TDialog1Form, Dialog1.sfm}
+uses
+  Classes, Graphics, Controls, Forms, Dialogs, StdCtrls;
+
+// ============================================================
+// CP-002 Calipers
+// Test Point Wizard — v1
+// Author: B. Wood
+//
+// Generates 10 test points per CP-002:
+//   - 7 outside (3 dial-position + 4 percentage-based)
+//   - 1 inside, 1 step, 1 depth
+//
+// Test point nominals sourced from Connor's ALQT_Test_Grids.xlsx
+// per Joe Gunn direction. Do not modify dial-position or
+// percentage-point values without QM approval — branches may
+// rely on these to match existing gage block sets.
+//
+// Branch-specific dial points (Company lookup) are stubbed
+// pending OCS values. PCS and default use Connor's grid values.
+//
+// Effective Range defaults to Full Scale but can be overridden
+// to accommodate customer-limited range requirements.
+// ============================================================
+
+// ── Yellow highlight on blank required fields ─────────────────
+procedure edtFullScaleChange(Sender: TObject);
+begin
+  if Trim(edtFullScale.Text) = '' then
+    edtFullScale.Color := clYellow
+  else
+    edtFullScale.Color := clWhite;
+end;
+
+procedure edtEffRangeChange(Sender: TObject);
+begin
+  if Trim(edtEffRange.Text) = '' then
+    edtEffRange.Color := clYellow
+  else
+    edtEffRange.Color := clWhite;
+end;
+
+// ── On units change, reset resolution dropdown ────────────────
+procedure cboUnitsChange(Sender: TObject);
+begin
+  cboResolution.Items.Clear;
+  if cboUnits.Text = 'in' then
+  begin
+    cboResolution.Items.Add('0.0005');
+    cboResolution.Items.Add('0.001');
+  end
+  else
+  begin
+    cboResolution.Items.Add('0.01');
+    cboResolution.Items.Add('0.02');
+  end;
+  cboResolution.ItemIndex := -1;
+end;
+
+// ── Form load ─────────────────────────────────────────────────
+procedure Form2Create(Sender: TObject);
+var
+  GageID   : string;
+  Capacity : string;
+  Units    : string;
+begin
+  GageID := LocatingEquipmentID;
+  edtGageID.Text := GageID;
+
+  if GageID = '' then
+  begin
+    ShowMessage(
+      'Could not determine the current equipment record.' + #13 +
+      'Please close and relaunch the wizard from an equipment record.'
+    );
+    Exit;
+  end;
+
+  // Pre-populate capacity from ATTRIBUTE1
+  Capacity := LookupEquipmentFieldText('ATTRIBUTE1');
+  edtFullScale.Text := Capacity;
+  if Capacity = '' then
+    edtFullScale.Color := clYellow
+  else
+    edtFullScale.Color := clWhite;
+
+  // Default effective range to full scale
+  edtEffRange.Text := Capacity;
+  if Capacity = '' then
+    edtEffRange.Color := clYellow
+  else
+    edtEffRange.Color := clWhite;
+
+  // Pre-populate units from UNIT_MEASURE
+  Units := LookupEquipmentFieldText('UNIT_MEASURE');
+  if Units <> '' then
+  begin
+    cboUnits.Text := Units;
+    cboUnitsChange(nil);
+  end;
+
+  // Seed resolution dropdown
+  if cboUnits.ItemIndex < 0 then
+  begin
+    cboResolution.Items.Add('0.0005');
+    cboResolution.Items.Add('0.001');
+    cboResolution.Items.Add('0.01');
+    cboResolution.Items.Add('0.02');
+  end;
+end;
+
+procedure btnCancelClick(Sender: TObject);
+begin
+  Close;
+end;
+
+procedure btnGenerateClick(Sender: TObject);
+var
+  GageID      : string;
+  Company     : string;
+  FullScale   : Double;
+  EffRange    : Double;
+  Units       : string;
+  Resolution  : string;
+  Missing     : string;
+  DateStr     : string;
+  TabName     : string;
+
+  // Dial position points (branch-specific)
+  // Sourced from ALQT_Test_Grids.xlsx per Joe Gunn direction
+  DialPt1     : Double;  // ~90 deg position
+  DialPt2     : Double;  // ~180 deg position
+  DialPt3     : Double;  // ~270 deg position
+
+  // Inside/Step/Depth nominals (tier-dependent)
+  FixedPt     : Double;
+
+  // Percentage-based outside points (25/50/75/100 of EffRange)
+  Pct25       : Double;
+  Pct50       : Double;
+  Pct75       : Double;
+  Pct100      : Double;
+
+  // Per-point tolerances (sourced directly from Connor's grids)
+  TolDial     : Double;  // tolerance for dial position points
+  TolPct25    : Double;
+  TolPct50    : Double;
+  TolPct75    : Double;
+  TolPct100   : Double;
+  TolFixed    : Double;  // tolerance for inside/step/depth
+
+  Seq         : Integer;
+  SQL         : string;
+
+  // Helper to insert one test point row
+  procedure InsertRow(LineNo: Integer; Desc: string; Nominal, TolPlus, TolMinus: Double);
+  begin
+    SQL :=
+      'INSERT INTO TESTPNTS ' +
+      '(COMPANY, GAGE_SN, LINE_NO, LINE_DESCRIPTION, ' +
+      'LINE_STANDARD, TOLERANCE1, TOLERANCE2, UNIT_MEASURE, CAL_TYPE) ' +
+      'VALUES (' +
+      '''' + Company + ''', ' +
+      '''' + GageID + ''', ' +
+      IntToStr(LineNo) + ', ' +
+      '''' + Desc + ''', ' +
+      FormatFloat('0.######', Nominal) + ', ' +
+      FormatFloat('0.######', TolPlus) + ', ' +
+      FormatFloat('0.######', TolMinus) + ', ' +
+      '''' + Units + ''', ' +
+      '''' + TabName + ''')';
+    ReturnFromSQL(SQL);
+  end;
+
+begin
+
+  // ── Re-grab context ──────────────────────────────────────────
+  GageID  := LocatingEquipmentID;
+  Company := LocatingEquipmentCompany;
+
+  if GageID = '' then
+  begin
+    ShowMessage('Could not determine the current equipment record. Please close and try again.');
+    Exit;
+  end;
+
+  // ── Consolidated validation ───────────────────────────────────
+  Missing := '';
+
+  if Trim(edtFullScale.Text) = '' then
+  begin
+    Missing := Missing + '  - Full Scale / Capacity' + #13;
+    edtFullScale.Color := clYellow;
+  end
+  else
+    edtFullScale.Color := clWhite;
+
+  if Trim(edtEffRange.Text) = '' then
+  begin
+    Missing := Missing + '  - Effective Range' + #13;
+    edtEffRange.Color := clYellow;
+  end
+  else
+    edtEffRange.Color := clWhite;
+
+  if cboUnits.ItemIndex < 0 then
+    Missing := Missing + '  - Units' + #13;
+
+  if cboResolution.ItemIndex < 0 then
+    Missing := Missing + '  - Resolution' + #13;
+
+  if Missing <> '' then
+  begin
+    ShowMessage(
+      'The following required fields must be completed before ' +
+      'test points can be generated:' + #13 + #13 +
+      Missing
+    );
+    Exit;
+  end;
+
+  // ── Numeric validation ────────────────────────────────────────
+  FullScale := StrToFloat(edtFullScale.Text);
+  EffRange  := StrToFloat(edtEffRange.Text);
+
+  if FullScale <= 0 then
+  begin
+    ShowMessage('Full Scale value must be greater than zero.');
+    edtFullScale.Color := clYellow;
+    Exit;
+  end;
+
+  if EffRange <= 0 then
+  begin
+    ShowMessage('Effective Range must be greater than zero.');
+    edtEffRange.Color := clYellow;
+    Exit;
+  end;
+
+  if EffRange > FullScale then
+  begin
+    ShowMessage(
+      'Effective Range cannot exceed Full Scale capacity.' + #13 +
+      'Please correct and try again.'
+    );
+    edtEffRange.Color := clYellow;
+    Exit;
+  end;
+
+  Units      := cboUnits.Text;
+  Resolution := cboResolution.Text;
+
+  // ── Build dated tab name ──────────────────────────────────────
+  DateStr := ReturnFromSQL('SELECT FORMAT(GETDATE(), ''MMddyyyy'')');
+  TabName := 'AL_' + DateStr;
+
+  // ── Dial position points — branch lookup ─────────────────────
+  // Sourced from ALQT_Test_Grids.xlsx (CALIPER, 6 IN sheet)
+  // per Joe Gunn direction. These are fixed gage block positions,
+  // not percentages, and do not scale with EffRange.
+  // OCS branch values TBD — stub here, fill in when received.
+  // NOTE: Dial position points are in the instrument's native units.
+  if Units = 'in' then
+  begin
+    if Company = 'OCS' then
+    begin
+      // TODO: Replace with OCS-specific dial position values when received
+      DialPt1 := 0.125;
+      DialPt2 := 0.250;
+      DialPt3 := 0.375;
+    end
+    else if Company = 'PCS' then
+    begin
+      // PCS confirmed matching Connor's default grid values
+      DialPt1 := 0.125;
+      DialPt2 := 0.250;
+      DialPt3 := 0.375;
+    end
+    else
+    begin
+      // Default: Connor's ALQT_Test_Grids.xlsx values
+      DialPt1 := 0.125;
+      DialPt2 := 0.250;
+      DialPt3 := 0.375;
+    end;
+  end
+  else
+  begin
+    // Metric dial position points from ALQT_Test_Grids.xlsx (150MM sheet)
+    DialPt1 := 1.25;
+    DialPt2 := 1.50;
+    DialPt3 := 1.75;
+  end;
+
+  // ── Percentage-based outside points ──────────────────────────
+  // Calculated from Effective Range, not Full Scale
+  Pct25  := 0.25 * EffRange;
+  Pct50  := 0.50 * EffRange;
+  Pct75  := 0.75 * EffRange;
+  Pct100 := 1.00 * EffRange;
+
+  // ── Tolerance and fixed point lookup by tier + resolution ────
+  // Values sourced directly from ALQT_Test_Grids.xlsx.
+  // Tolerance stored as offset (half-band); TolPlus = Nominal + Tol,
+  // TolMinus = Nominal - Tol.
+  // Tier determined by Full Scale in native units.
+  //
+  // NOTE: Inside/Step/Depth nominal is tier-dependent:
+  //   6" and under: 1.000 in / 20 mm
+  //   Over 12" in:  3.000 in (Step/Depth not in Connor's larger grids
+  //                 — using 3" inside value as placeholder; verify with QM)
+  //
+  if Units = 'in' then
+  begin
+    if FullScale <= 6 then
+    begin
+      // CALIPER, 6 IN tier
+      FixedPt   := 1.000;
+      TolFixed  := 0.001;
+      TolDial   := 0.001;
+      if Resolution = '0.0005' then
+      begin
+        TolPct25  := 0.001;
+        TolPct50  := 0.001;
+        TolPct75  := 0.001;
+        TolPct100 := 0.001;
+      end
+      else  // 0.001
+      begin
+        TolPct25  := 0.001;
+        TolPct50  := 0.001;
+        TolPct75  := 0.001;
+        TolPct100 := 0.001;
+      end;
+    end
+    else if FullScale <= 12 then
+    begin
+      // CALIPER, 6+ -12 IN tier
+      // Tolerance steps up at larger points per Connor's grids
+      FixedPt   := 1.000;
+      TolFixed  := 0.001;
+      TolDial   := 0.001;
+      if Resolution = '0.0005' then
+      begin
+        TolPct25  := 0.001;   // ~25% falls in low range, ±0.001
+        TolPct50  := 0.001;
+        TolPct75  := 0.0015;  // upper points step up to ±0.0015
+        TolPct100 := 0.0015;
+      end
+      else  // 0.001
+      begin
+        TolPct25  := 0.001;
+        TolPct50  := 0.001;
+        TolPct75  := 0.002;
+        TolPct100 := 0.002;
+      end;
+    end
+    else if FullScale <= 24 then
+    begin
+      // CALIPER, 12+ -24 IN tier
+      FixedPt   := 3.000;
+      TolFixed  := 0.001;
+      TolDial   := 0.001;
+      if Resolution = '0.0005' then
+      begin
+        TolPct25  := 0.001;
+        TolPct50  := 0.0015;
+        TolPct75  := 0.002;
+        TolPct100 := 0.002;
+      end
+      else  // 0.001
+      begin
+        TolPct25  := 0.001;
+        TolPct50  := 0.002;
+        TolPct75  := 0.002;
+        TolPct100 := 0.002;
+      end;
+    end
+    else if FullScale <= 36 then
+    begin
+      // CALIPER, 24+ -36 IN tier
+      FixedPt   := 3.000;
+      TolFixed  := 0.001;
+      TolDial   := 0.001;
+      if Resolution = '0.0005' then
+      begin
+        TolPct25  := 0.0015;
+        TolPct50  := 0.002;
+        TolPct75  := 0.002;
+        TolPct100 := 0.003;
+      end
+      else  // 0.001
+      begin
+        TolPct25  := 0.002;
+        TolPct50  := 0.002;
+        TolPct75  := 0.002;
+        TolPct100 := 0.003;
+      end;
+    end
+    else
+    begin
+      // CALIPER, 36+ -60 IN tier
+      FixedPt   := 3.000;
+      TolFixed  := 0.001;
+      TolDial   := 0.001;
+      if Resolution = '0.0005' then
+      begin
+        TolPct25  := 0.0015;
+        TolPct50  := 0.0025;
+        TolPct75  := 0.003;
+        TolPct100 := 0.003;
+      end
+      else  // 0.001
+      begin
+        TolPct25  := 0.002;
+        TolPct50  := 0.003;
+        TolPct75  := 0.003;
+        TolPct100 := 0.003;
+      end;
+    end;
+  end
+  else
+  begin
+    // Metric tier lookup
+    if FullScale <= 150 then
+    begin
+      // 150 MM tier
+      FixedPt  := 20.0;
+      TolFixed := 0.03;
+      TolDial  := 0.02;
+      if Resolution = '0.01' then
+      begin
+        TolPct25  := 0.03;
+        TolPct50  := 0.03;
+        TolPct75  := 0.03;
+        TolPct100 := 0.03;
+      end
+      else  // 0.02
+      begin
+        TolPct25  := 0.04;
+        TolPct50  := 0.04;
+        TolPct75  := 0.04;
+        TolPct100 := 0.04;
+      end;
+    end
+    else if FullScale <= 300 then
+    begin
+      // 200-300 MM tier
+      FixedPt  := 20.0;
+      TolFixed := 0.02;
+      TolDial  := 0.02;
+      if Resolution = '0.01' then
+      begin
+        TolPct25  := 0.02;
+        TolPct50  := 0.03;
+        TolPct75  := 0.03;
+        TolPct100 := 0.03;
+      end
+      else  // 0.02
+      begin
+        TolPct25  := 0.02;
+        TolPct50  := 0.04;
+        TolPct75  := 0.04;
+        TolPct100 := 0.04;
+      end;
+    end
+    else if FullScale <= 600 then
+    begin
+      // 450-600 MM tier
+      FixedPt  := 100.0;
+      TolFixed := 0.03;
+      TolDial  := 0.02;
+      if Resolution = '0.01' then
+      begin
+        TolPct25  := 0.03;
+        TolPct50  := 0.03;
+        TolPct75  := 0.04;
+        TolPct100 := 0.04;
+      end
+      else  // 0.02
+      begin
+        TolPct25  := 0.04;
+        TolPct50  := 0.04;
+        TolPct75  := 0.04;
+        TolPct100 := 0.04;
+      end;
+    end
+    else if FullScale <= 900 then
+    begin
+      // 900 MM tier
+      FixedPt  := 100.0;
+      TolFixed := 0.03;
+      TolDial  := 0.02;
+      if Resolution = '0.01' then
+      begin
+        TolPct25  := 0.04;
+        TolPct50  := 0.04;
+        TolPct75  := 0.05;
+        TolPct100 := 0.07;
+      end
+      else  // 0.02
+      begin
+        TolPct25  := 0.04;
+        TolPct50  := 0.04;
+        TolPct75  := 0.06;
+        TolPct100 := 0.08;
+      end;
+    end
+    else if FullScale <= 1000 then
+    begin
+      // 1000 MM tier
+      FixedPt  := 100.0;
+      TolFixed := 0.03;
+      TolDial  := 0.02;
+      if Resolution = '0.01' then
+      begin
+        TolPct25  := 0.04;
+        TolPct50  := 0.05;
+        TolPct75  := 0.06;
+        TolPct100 := 0.07;
+      end
+      else  // 0.02
+      begin
+        TolPct25  := 0.04;
+        TolPct50  := 0.06;
+        TolPct75  := 0.06;
+        TolPct100 := 0.08;
+      end;
+    end
+    else
+    begin
+      // 1500 MM tier
+      FixedPt  := 100.0;
+      TolFixed := 0.03;
+      TolDial  := 0.02;
+      if Resolution = '0.01' then
+      begin
+        TolPct25  := 0.04;
+        TolPct50  := 0.05;
+        TolPct75  := 0.07;
+        TolPct100 := 0.07;
+      end
+      else  // 0.02
+      begin
+        TolPct25  := 0.04;
+        TolPct50  := 0.06;
+        TolPct75  := 0.08;
+        TolPct100 := 0.08;
+      end;
+    end;
+  end;
+
+  // ── Write attributes back to equipment record ─────────────────
+  SetEquipmentFieldText('ATTRIBUTE1', edtFullScale.Text);
+  SetEquipmentFieldText('UNIT_MEASURE', Units);
+
+  // ── Clear existing rows for this tab only ─────────────────────
+  ReturnFromSQL(
+    'DELETE FROM TESTPNTS ' +
+    'WHERE GAGE_SN = ''' + GageID + ''' ' +
+    'AND COMPANY = ''' + Company + ''' ' +
+    'AND CAL_TYPE = ''' + TabName + ''''
+  );
+
+  // ── Insert test point rows ────────────────────────────────────
+  Seq := 1;
+
+  // Outside: dial position points (fixed nominals, not scaled)
+  InsertRow(Seq, 'Outside Length - Dial Position 1 (~90 deg)', DialPt1, DialPt1 + TolDial, DialPt1 - TolDial); Inc(Seq);
+  InsertRow(Seq, 'Outside Length - Dial Position 2 (~180 deg)', DialPt2, DialPt2 + TolDial, DialPt2 - TolDial); Inc(Seq);
+  InsertRow(Seq, 'Outside Length - Dial Position 3 (~270 deg)', DialPt3, DialPt3 + TolDial, DialPt3 - TolDial); Inc(Seq);
+
+  // Outside: percentage-based points (scaled to Effective Range)
+  InsertRow(Seq, 'Outside Length - 25% of Effective Range', Pct25, Pct25 + TolPct25, Pct25 - TolPct25); Inc(Seq);
+  InsertRow(Seq, 'Outside Length - 50% of Effective Range', Pct50, Pct50 + TolPct50, Pct50 - TolPct50); Inc(Seq);
+  InsertRow(Seq, 'Outside Length - 75% of Effective Range', Pct75, Pct75 + TolPct75, Pct75 - TolPct75); Inc(Seq);
+  InsertRow(Seq, 'Outside Length - 100% of Effective Range', Pct100, Pct100 + TolPct100, Pct100 - TolPct100); Inc(Seq);
+
+  // Inside, Step, Depth (fixed tier-based nominals)
+  InsertRow(Seq, 'Inside Length', FixedPt, FixedPt + TolFixed, FixedPt - TolFixed); Inc(Seq);
+  InsertRow(Seq, 'Step', FixedPt, FixedPt + TolFixed, FixedPt - TolFixed); Inc(Seq);
+  InsertRow(Seq, 'Depth', FixedPt, FixedPt + TolFixed, FixedPt - TolFixed);
+
+  // ── Set new tab as default on equipment record ────────────────
+  ReturnFromSQL(
+    'UPDATE GAGES SET CAL_TYPE = ''' + TabName + ''' ' +
+    'WHERE GAGE_SN = ''' + GageID + ''' ' +
+    'AND COMPANY = ''' + Company + ''''
+  );
+
+  // ── Refresh the test points grid ─────────────────────────────
+  RefreshTestPointsGrid;
+
+  // ── Confirm and close ─────────────────────────────────────────
+  ShowMessage(
+    'Test points written successfully.' + #13 +
+    'Gage ID        : ' + GageID + #13 +
+    'Company        : ' + Company + #13 +
+    'Full Scale     : ' + edtFullScale.Text + ' ' + Units + #13 +
+    'Effective Range: ' + edtEffRange.Text + ' ' + Units + #13 +
+    'Resolution     : ' + Resolution + #13 +
+    'Tab            : ' + TabName + #13 +
+    '10 test point rows written.'
+  );
+
+  Close;
+end;
+
+begin
+end.
